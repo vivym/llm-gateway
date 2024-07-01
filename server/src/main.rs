@@ -27,6 +27,10 @@ struct Args {
     client_token: Option<String>,
     #[clap(long, env)]
     num_threads: Option<usize>,
+    #[clap(long, env, default_value_t = 10)]
+    heartbeat_interval: u64,
+    #[clap(long, env, default_value_t = 5)]
+    heartbeat_timeout: u64,
     #[clap(long, env)]
     otlp_endpoint: Option<String>,
     #[clap(long, env, default_value = "info")]
@@ -52,6 +56,8 @@ fn main() -> Result<(), LLMGatewayError> {
         access_token,
         client_token,
         num_threads,
+        heartbeat_interval,
+        heartbeat_timeout,
         otlp_endpoint,
         log_level,
         log_format,
@@ -107,7 +113,14 @@ fn main() -> Result<(), LLMGatewayError> {
         .worker_threads(num_threads)
         .enable_all()
         .build()?
-        .block_on(server::run(addr, cors_allow_origin, access_token, client_token))?;
+        .block_on(server::run(
+            addr,
+            cors_allow_origin,
+            access_token,
+            client_token,
+            heartbeat_interval,
+            heartbeat_timeout,
+        ))?;
 
     Ok(())
 }

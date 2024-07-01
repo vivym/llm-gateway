@@ -5,14 +5,18 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use thiserror::Error;
 use serde_json::json;
+use thiserror::Error;
 
 use crate::server::AppState;
 use common::schemas::ErrorCode;
 
 pub(crate) async fn auth_middleware(
-    State(AppState { access_token, client_token }): State<AppState>,
+    State(AppState {
+        access_token,
+        client_token,
+        ..
+    }): State<AppState>,
     req: Request,
     next: Next,
 ) -> Result<impl IntoResponse, AuthError> {
@@ -20,13 +24,7 @@ pub(crate) async fn auth_middleware(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|auth_header| auth_header.to_str().ok())
-        .and_then(|auth_header| {
-            if auth_header.starts_with("Bearer ") {
-                Some(auth_header[7..].to_owned())
-            } else {
-                None
-            }
-        });
+        .and_then(|auth_header| auth_header.strip_prefix("Bearer "));
 
     let token = token.ok_or(AuthError::MissingAuthorizationHeader)?;
 
@@ -36,10 +34,8 @@ pub(crate) async fn auth_middleware(
         if token != client_token {
             return Err(AuthError::InvalidAccessToken);
         }
-    } else {
-        if token != access_token {
-            return Err(AuthError::InvalidAccessToken);
-        }
+    } else if token != access_token {
+        return Err(AuthError::InvalidAccessToken);
     }
 
     Ok(next.run(req).await)
@@ -68,10 +64,6 @@ impl IntoResponse for AuthError {
             ),
         };
 
-        (
-            status,
-            Json(json!({"code": code, "msg": err_msg})),
-        )
-            .into_response()
+        (status, Json(json!({"code": code, "msg": err_msg}))).into_response()
     }
 }

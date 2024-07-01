@@ -1,13 +1,17 @@
 use std::{
     net::SocketAddr,
     ops::ControlFlow,
-    sync::{atomic::{AtomicBool, AtomicI64, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicI64, Ordering},
+        Arc,
+    },
 };
 
 use axum::{
     extract::{
         connect_info::ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
     },
     response::IntoResponse,
     Extension,
@@ -17,23 +21,32 @@ use futures::{SinkExt, StreamExt};
 use streamunordered::{StreamUnordered, StreamYield};
 use tracing::instrument;
 
-use crate::manager::ClientManager;
+use crate::{manager::ClientManager, server::AppState};
 use common::schemas::{APIResponse, ListModelsResponse};
 
 #[instrument(skip_all)]
 pub(crate) async fn ws_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(AppState {
+        heartbeat_interval,
+        heartbeat_timeout,
+        ..
+    }): State<AppState>,
     Extension(manager): Extension<ClientManager>,
 ) -> impl IntoResponse {
     tracing::info!("WebSocket connection from {}", addr);
-    ws.on_upgrade(move |socket| handle_socket(socket, addr, manager))
+    ws.on_upgrade(move |socket| {
+        handle_socket(socket, addr, manager, heartbeat_interval, heartbeat_timeout)
+    })
 }
 
 async fn handle_socket(
     mut socket: WebSocket,
     who: SocketAddr,
     manager: ClientManager,
+    heartbeat_interval: u64,
+    heartbeat_timeout: u64,
 ) {
     if socket.send(Message::Ping("Hello".into())).await.is_ok() {
         tracing::info!("Ping sent to {}", who);
@@ -191,8 +204,7 @@ async fn handle_socket(
             if last_heartbeat > 0 {
                 let now = chrono::Utc::now().timestamp();
 
-                // TODO: make this configurable
-                if (now - last_heartbeat).abs() > 10 {
+                if (now - last_heartbeat).abs() > heartbeat_timeout as _ {
                     tracing::error!(
                         "Client {} has not sent a heartbeat in more than 10 seconds",
                         who
@@ -201,8 +213,7 @@ async fn handle_socket(
                 }
             }
 
-            // TOOD: make this configurable
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(heartbeat_interval)).await;
         }
 
         tracing::info!("Heartbeat task completed for {}", who);

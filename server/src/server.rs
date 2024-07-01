@@ -26,6 +26,8 @@ use crate::{
 pub struct AppState {
     pub access_token: String,
     pub client_token: String,
+    pub heartbeat_interval: u64,
+    pub heartbeat_timeout: u64,
 }
 
 #[instrument]
@@ -41,6 +43,8 @@ pub async fn run(
     allow_origin: Option<AllowOrigin>,
     access_token: String,
     client_token: String,
+    heartbeat_interval: u64,
+    heartbeat_timeout: u64,
 ) -> Result<(), WebServerError> {
     let allow_origin = allow_origin.unwrap_or_else(AllowOrigin::any);
     let cors_layer = CorsLayer::new()
@@ -97,6 +101,8 @@ pub async fn run(
     let state = AppState {
         access_token,
         client_token,
+        heartbeat_interval,
+        heartbeat_timeout,
     };
 
     let app = Router::new()
@@ -107,7 +113,10 @@ pub async fn run(
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .layer(Extension(ClientManager::new()))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state)
         .merge(swagger_ui)
         .fallback(not_found)

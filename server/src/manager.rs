@@ -42,6 +42,7 @@ impl ClientManager {
             .clients
             .entry(model_info.id.clone())
             .or_insert_with(|| {
+                // TODO: make buffer size configurable
                 let (tx, rx) = async_channel::bounded(32);
                 ClientInfo {
                     model_info,

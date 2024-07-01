@@ -9,7 +9,7 @@ use mimalloc::MiMalloc;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest_eventsource::{Error as EventSourceError, Event, EventSource};
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle, signal};
+use tokio::{signal, sync::mpsc, task::JoinHandle};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tungstenite::ClientRequestBuilder;
 
@@ -123,22 +123,20 @@ fn main() -> Result<(), ClientError> {
         .block_on(async move {
             let closing = Arc::new(AtomicBool::new(false));
 
-            let mut task = tokio::spawn(
-                start(
-                    gateway_url,
-                    token,
-                    api_url,
-                    timeout,
-                    healthz_interval,
-                    heartbeat_interval,
-                    retry,
-                    disable_health_check,
-                    headers,
-                    http_client,
-                    api_url_for_healthz,
-                    closing.clone(),
-                )
-            );
+            let mut task = tokio::spawn(start(
+                gateway_url,
+                token,
+                api_url,
+                timeout,
+                healthz_interval,
+                heartbeat_interval,
+                retry,
+                disable_health_check,
+                headers,
+                http_client,
+                api_url_for_healthz,
+                closing.clone(),
+            ));
 
             let ctrl_c = async {
                 signal::ctrl_c()
@@ -242,6 +240,7 @@ async fn start(
 
     tracing::info!("Model info sent");
 
+    // TODO: make the channel size configurable
     let (resp_sender, mut resp_receiver) = mpsc::channel::<Response>(1024);
     let resp_sender_hb = resp_sender.clone();
 
@@ -254,7 +253,7 @@ async fn start(
         while !closing_send.load(std::sync::atomic::Ordering::Relaxed) {
             match resp_receiver.recv().await {
                 Some(resp) => match resp {
-                    Response::API(resp) => {
+                    Response::Api(resp) => {
                         let resp = serde_json::to_string(&resp)?;
                         ws_sender.send(Message::Text(resp)).await?;
                     }
@@ -530,13 +529,10 @@ async fn handle_api_request(
                     };
 
                     if let Some(resp) = resp {
-                        resp_sender
-                            .send(Response::API(resp))
-                            .await
-                            .map_err(|e| {
-                                let msg = format!("Failed to send response: {}", e);
-                                ClientError::ChannelSend(msg)
-                            })?;
+                        resp_sender.send(Response::Api(resp)).await.map_err(|e| {
+                            let msg = format!("Failed to send response: {}", e);
+                            ClientError::ChannelSend(msg)
+                        })?;
                     }
 
                     if done {
@@ -603,13 +599,10 @@ async fn handle_api_request(
                     }
                 };
 
-                resp_sender
-                    .send(Response::API(resp))
-                    .await
-                    .map_err(|e| {
-                        let msg = format!("Failed to send response: {}", e);
-                        ClientError::ChannelSend(msg)
-                    })?;
+                resp_sender.send(Response::Api(resp)).await.map_err(|e| {
+                    let msg = format!("Failed to send response: {}", e);
+                    ClientError::ChannelSend(msg)
+                })?;
             }
         }
     }
@@ -618,7 +611,7 @@ async fn handle_api_request(
 }
 
 enum Response {
-    API(APIResponse),
+    Api(APIResponse),
     Heartbeat,
 }
 
