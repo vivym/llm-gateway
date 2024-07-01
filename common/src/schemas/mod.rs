@@ -19,6 +19,10 @@ pub enum ErrorCode {
     Unhealthy = 3000,
     /// Backend service error.
     BackendError = 4000,
+    /// Missing authorization header.
+    MissingAuthorizationHeader = 5000,
+    /// Invalid access token.
+    InvalidAccessToken = 5001,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Debug)]
@@ -84,6 +88,3 @@ pub enum APIResponseBodySuccess {
 pub enum APIResponseError {
     ErrorResponse(ErrorResponse),
 }
-
-#[derive(Clone)]
-pub struct ClientToken(pub Vec<u8>);

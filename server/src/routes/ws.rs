@@ -1,10 +1,7 @@
 use std::{
     net::SocketAddr,
     ops::ControlFlow,
-    sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
-        Arc,
-    },
+    sync::{atomic::{AtomicBool, AtomicI64, Ordering}, Arc},
 };
 
 use axum::{
@@ -21,24 +18,22 @@ use streamunordered::{StreamUnordered, StreamYield};
 use tracing::instrument;
 
 use crate::manager::ClientManager;
-use common::schemas::{APIResponse, ClientToken, ListModelsResponse};
+use common::schemas::{APIResponse, ListModelsResponse};
 
 #[instrument(skip_all)]
 pub(crate) async fn ws_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Extension(manager): Extension<ClientManager>,
-    Extension(ClientToken(client_token)): Extension<ClientToken>,
 ) -> impl IntoResponse {
     tracing::info!("WebSocket connection from {}", addr);
-    ws.on_upgrade(move |socket| handle_socket(socket, addr, manager, client_token))
+    ws.on_upgrade(move |socket| handle_socket(socket, addr, manager))
 }
 
 async fn handle_socket(
     mut socket: WebSocket,
     who: SocketAddr,
     manager: ClientManager,
-    client_token: Vec<u8>,
 ) {
     if socket.send(Message::Ping("Hello".into())).await.is_ok() {
         tracing::info!("Ping sent to {}", who);
@@ -49,13 +44,8 @@ async fn handle_socket(
 
     if let Some(Ok(msg)) = socket.recv().await {
         match msg {
-            Message::Pong(b) => {
+            Message::Pong(_) => {
                 tracing::info!("Pong received from {}", who);
-                if b != client_token {
-                    tracing::error!("Client token mismatch from {}", who);
-                    return;
-                }
-                tracing::info!("Client token verified for {}", who);
             }
             _ => {
                 tracing::error!("Unexpected message received from {}: {:?}", who, msg);
@@ -211,6 +201,7 @@ async fn handle_socket(
                 }
             }
 
+            // TOOD: make this configurable
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
 

@@ -9,8 +9,9 @@ use mimalloc::MiMalloc;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest_eventsource::{Error as EventSourceError, Event, EventSource};
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{sync::mpsc, task::JoinHandle, signal};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tungstenite::ClientRequestBuilder;
 
 use common::{
     logging::{init_logging, LogFormat, LogLevel},
@@ -119,19 +120,63 @@ fn main() -> Result<(), ClientError> {
         .worker_threads(num_threads)
         .enable_all()
         .build()?
-        .block_on(start(
-            gateway_url,
-            token,
-            api_url,
-            timeout,
-            healthz_interval,
-            heartbeat_interval,
-            retry,
-            disable_health_check,
-            headers,
-            http_client,
-            api_url_for_healthz,
-        ))?;
+        .block_on(async move {
+            let closing = Arc::new(AtomicBool::new(false));
+
+            let mut task = tokio::spawn(
+                start(
+                    gateway_url,
+                    token,
+                    api_url,
+                    timeout,
+                    healthz_interval,
+                    heartbeat_interval,
+                    retry,
+                    disable_health_check,
+                    headers,
+                    http_client,
+                    api_url_for_healthz,
+                    closing.clone(),
+                )
+            );
+
+            let ctrl_c = async {
+                signal::ctrl_c()
+                    .await
+                    .expect("Failed to install CTRL+C signal handler");
+            };
+
+            #[cfg(unix)]
+            let terminate = async {
+                signal::unix::signal(signal::unix::SignalKind::terminate())
+                    .expect("Failed to install terminate signal handler")
+                    .recv()
+                    .await;
+            };
+
+            #[cfg(not(unix))]
+            let terminate = std::future::pending::<()>();
+
+            tokio::select! {
+                res = (&mut task) => {
+                    let _ = res?;
+                },
+                _ = ctrl_c => {
+                    tracing::info!("Received Ctrl-C, starting graceful shutdown");
+                    closing.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = task.await?;
+                },
+                _ = terminate => {
+                    tracing::info!("Received terminate signal, starting graceful shutdown");
+                    closing.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = task.await?;
+                },
+            }
+
+            opentelemetry::global::shutdown_tracer_provider();
+
+            Result::<(), ClientError>::Ok(())
+        })?;
 
     Ok(())
 }
@@ -149,6 +194,7 @@ async fn start(
     headers: HeaderMap,
     http_client: reqwest::Client,
     api_url_for_healthz: String,
+    closing: Arc<AtomicBool>,
 ) -> Result<(), ClientError> {
     if !disable_health_check {
         check_health(&http_client, &api_url).await?;
@@ -157,7 +203,9 @@ async fn start(
     let models = list_models(&http_client, &api_url).await?;
     tracing::info!("Models: {:?}", models);
 
-    let (ws_stream, _) = connect_async(&gateway_url).await?;
+    let builder = ClientRequestBuilder::new(gateway_url.parse().unwrap())
+        .with_header("Authorization", format!("Bearer {}", token));
+    let (ws_stream, _) = connect_async(builder).await?;
 
     tracing::info!("Connected to gateway: {}", gateway_url);
 
@@ -197,7 +245,6 @@ async fn start(
     let (resp_sender, mut resp_receiver) = mpsc::channel::<Response>(1024);
     let resp_sender_hb = resp_sender.clone();
 
-    let closing = Arc::new(AtomicBool::new(false));
     let closing_send = closing.clone();
     let closing_recv = closing.clone();
     let closing_healthz = closing.clone();
@@ -207,7 +254,7 @@ async fn start(
         while !closing_send.load(std::sync::atomic::Ordering::Relaxed) {
             match resp_receiver.recv().await {
                 Some(resp) => match resp {
-                    Response::APIResponse(resp) => {
+                    Response::API(resp) => {
                         let resp = serde_json::to_string(&resp)?;
                         ws_sender.send(Message::Text(resp)).await?;
                     }
@@ -291,7 +338,7 @@ async fn start(
     let mut heartbeat_task: JoinHandle<Result<(), ClientError>> = tokio::spawn(async move {
         while !closing_hearbeat.load(std::sync::atomic::Ordering::Relaxed) {
             resp_sender_hb
-                .send(Response::heartbeat())
+                .send(Response::Heartbeat)
                 .await
                 .map_err(|e| {
                     let msg = format!("Failed to send heartbeat: {}", e);
@@ -484,7 +531,7 @@ async fn handle_api_request(
 
                     if let Some(resp) = resp {
                         resp_sender
-                            .send(Response::from_api_response(resp))
+                            .send(Response::API(resp))
                             .await
                             .map_err(|e| {
                                 let msg = format!("Failed to send response: {}", e);
@@ -557,7 +604,7 @@ async fn handle_api_request(
                 };
 
                 resp_sender
-                    .send(Response::from_api_response(resp))
+                    .send(Response::API(resp))
                     .await
                     .map_err(|e| {
                         let msg = format!("Failed to send response: {}", e);
@@ -571,18 +618,8 @@ async fn handle_api_request(
 }
 
 enum Response {
-    APIResponse(APIResponse),
+    API(APIResponse),
     Heartbeat,
-}
-
-impl Response {
-    pub fn from_api_response(resp: APIResponse) -> Self {
-        Response::APIResponse(resp)
-    }
-
-    pub fn heartbeat() -> Self {
-        Response::Heartbeat
-    }
 }
 
 #[derive(Error, Debug)]

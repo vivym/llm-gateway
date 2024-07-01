@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use axum::{
     extract::Extension,
     http::{self, Method},
+    middleware,
     response::IntoResponse,
     routing::{get, post},
     Router,
@@ -17,9 +18,15 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
     manager::ClientManager,
+    middlewares::auth::auth_middleware,
     routes::{chat::chat_completions, healthz::healthz, models::list_models, ws::ws_handler},
 };
-use common::schemas::ClientToken;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub access_token: String,
+    pub client_token: String,
+}
 
 #[instrument]
 async fn not_found(uri: http::Uri) -> impl IntoResponse {
@@ -32,6 +39,7 @@ async fn not_found(uri: http::Uri) -> impl IntoResponse {
 pub async fn run(
     addr: SocketAddr,
     allow_origin: Option<AllowOrigin>,
+    access_token: String,
     client_token: String,
 ) -> Result<(), WebServerError> {
     let allow_origin = allow_origin.unwrap_or_else(AllowOrigin::any);
@@ -86,6 +94,11 @@ pub async fn run(
 
     let swagger_ui = SwaggerUi::new("/docs").url("/api-doc/openapi.json", doc);
 
+    let state = AppState {
+        access_token,
+        client_token,
+    };
+
     let app = Router::new()
         .route("/", get(healthz))
         .route("/healthz", get(healthz))
@@ -94,7 +107,8 @@ pub async fn run(
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .layer(Extension(ClientManager::new()))
-        .layer(Extension(ClientToken(client_token.into())))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state)
         .merge(swagger_ui)
         .fallback(not_found)
         .layer(OtelAxumLayer::default())
@@ -136,6 +150,8 @@ async fn shutdown_signal() {
 
     tracing::info!("Signal received, starting graceful shutdown");
     opentelemetry::global::shutdown_tracer_provider();
+
+    // TODO: gracefully clean up clients
 }
 
 #[derive(Debug, Error)]
@@ -144,6 +160,8 @@ pub enum WebServerError {
     Io(#[from] std::io::Error),
     #[error("Axum error: {0}")]
     Axum(#[from] axum::BoxError),
+    #[error("Invalid access token")]
+    InvalidAccessToken,
     #[error("Invalid client token")]
     InvalidClientToken,
 }

@@ -22,6 +22,8 @@ struct Args {
     #[clap(long, env)]
     cors_allow_origin: Option<Vec<String>>,
     #[clap(long, env)]
+    access_token: Option<String>,
+    #[clap(long, env)]
     client_token: Option<String>,
     #[clap(long, env)]
     num_threads: Option<usize>,
@@ -47,6 +49,7 @@ fn main() -> Result<(), LLMGatewayError> {
         host,
         port,
         cors_allow_origin,
+        access_token,
         client_token,
         num_threads,
         otlp_endpoint,
@@ -62,6 +65,16 @@ fn main() -> Result<(), LLMGatewayError> {
         log_format,
         log_colorize,
     );
+
+    let access_token = access_token.unwrap_or_else(generate_client_token);
+    if access_token.len() < 32 {
+        tracing::warn!("Invalid access token length: {}", access_token.len());
+        return Err(LLMGatewayError::WebServerError(
+            server::WebServerError::InvalidAccessToken,
+        ));
+    }
+
+    tracing::info!("Access token: {}", access_token);
 
     let client_token = client_token.unwrap_or_else(generate_client_token);
     if client_token.len() < 32 {
@@ -94,7 +107,7 @@ fn main() -> Result<(), LLMGatewayError> {
         .worker_threads(num_threads)
         .enable_all()
         .build()?
-        .block_on(server::run(addr, cors_allow_origin, client_token))?;
+        .block_on(server::run(addr, cors_allow_origin, access_token, client_token))?;
 
     Ok(())
 }
