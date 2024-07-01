@@ -4,22 +4,20 @@ use async_stream::__private::AsyncStream;
 use axum::{
     extract::Extension,
     http::StatusCode,
-    response::{sse::{Event, KeepAlive}, IntoResponse, Response, Sse},
+    response::{
+        sse::{Event, KeepAlive},
+        IntoResponse, Response, Sse,
+    },
     Json,
 };
 use tokio::sync::mpsc;
 use tracing::instrument;
 
+use crate::manager::{ClientManager, ClientManagerError};
 use common::schemas::{
-    APIRequestBody,
-    APIResponse,
-    APIResponseBody,
-    APIResponseBodySuccess,
-    ChatRequest,
-    ErrorCode,
+    APIRequestBody, APIResponse, APIResponseBody, APIResponseBodySuccess, ChatRequest, ErrorCode,
     ErrorResponse,
 };
-use crate::manager::{ClientManager, ClientManagerError};
 
 #[utoipa::path(
     post,
@@ -39,7 +37,7 @@ use crate::manager::{ClientManager, ClientManagerError};
             description = "Generation Error",
             body = ErrorResponse,
         ),
-    )
+    ),
 )]
 #[instrument(skip_all)]
 pub(crate) async fn chat_completions(
@@ -48,16 +46,13 @@ pub(crate) async fn chat_completions(
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let stream_mode = req.stream;
     let model_id = req.model.clone();
-    let (tx, mut rx) = mpsc::channel::<APIResponse>(
-        if stream_mode {
-            4
-        } else {
-            1
-        }
-    );
+    let (tx, mut rx) = mpsc::channel::<APIResponse>(if stream_mode { 4 } else { 1 });
     tracing::info!("Request: {:?}", req);
 
-    match manager.send_request(model_id, APIRequestBody::OpenAIChat(req), tx).await {
+    match manager
+        .send_request(model_id, APIRequestBody::OpenAIChat(req), tx)
+        .await
+    {
         Ok(_) => {
             if stream_mode {
                 let resp_stream: AsyncStream<Result<Event, Infallible>, _> = async_stream::stream! {
@@ -86,7 +81,10 @@ pub(crate) async fn chat_completions(
                                         tracing::error!("Error response from backend: {:?}", err);
                                         let event = Event::default()
                                             .json_data(err)
-                                            .unwrap_or_else(|_| Event::default());
+                                            .unwrap_or_else(|_| {
+                                                tracing::error!("Failed to serialize error response");
+                                                Event::default()
+                                            });
 
                                         yield Ok(event);
                                         break;
@@ -106,32 +104,41 @@ pub(crate) async fn chat_completions(
 
                     tracing::info!("RespStream ended");
                 };
-                let sse = Sse::new(resp_stream)
-                    .keep_alive(KeepAlive::default());
+                let sse = Sse::new(resp_stream).keep_alive(KeepAlive::default());
                 Ok(sse.into_response())
             } else {
-                let resp = rx.recv().await.unwrap();
-                match resp.body {
-                    APIResponseBody::Success(resp) => match resp {
-                        APIResponseBodySuccess::OpenAIChatCompletion(chat_completion) => {
-                            Ok(Json(chat_completion).into_response())
+                match rx.recv().await {
+                    Some(resp) => match resp.body {
+                        APIResponseBody::Success(resp) => match resp {
+                            APIResponseBodySuccess::OpenAIChatCompletion(chat_completion) => {
+                                Ok(Json(chat_completion).into_response())
+                            }
+                            _ => Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse {
+                                    error: ErrorCode::BackendError,
+                                    message: "Invalid response from backend".to_string(),
+                                }),
+                            )),
                         },
-                        _ => Err((
+                        APIResponseBody::Error(err) => {
+                            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
+                        }
+                        _ => unreachable!("Invalid response from backend"),
+                    },
+                    None => {
+                        tracing::info!("Channel closed unexpectedly");
+                        Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(ErrorResponse {
-                                error: ErrorCode::BackendError,
-                                message: "Invalid response from backend".to_string(),
+                                error: ErrorCode::InternalError,
+                                message: "Channel closed unexpectedly".to_string(),
                             }),
-                        )),
-                    },
-                    APIResponseBody::Error(err) => Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(err),
-                    )),
-                    _ => unreachable!("Invalid response from backend"),
+                        ))
+                    }
                 }
             }
-        },
+        }
         Err(ClientManagerError::ModelNotFound(model_id)) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {

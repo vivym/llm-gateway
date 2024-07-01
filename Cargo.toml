@@ -27,9 +27,11 @@ serde_repr = "0.1.19"
 thiserror = "1.0.61"
 futures = "0.3.30"
 utoipa = { version = "4.2.3", features = ["axum_extras", "repr"] }
+num_cpus = "1.16.0"
+mimalloc = "0.1.43"
 
 [profile.release]
-incremental = true
+incremental = false
 lto = true
 opt-level = 3
 debug = true
@@ -39,7 +41,6 @@ panic = "abort"
 inherits = "release"
 debug = false
 incremental = false
-lto = "fat"
 codegen-units = 1
 
 [profile.dev]

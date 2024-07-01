@@ -18,8 +18,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 reqwest-eventsource = "0.6.0"
 chrono.workspace = true
-
 common = { path = "../common" }
+num_cpus.workspace = true
+mimalloc.workspace = true
 
 [build-dependencies]
 vergen.workspace = true

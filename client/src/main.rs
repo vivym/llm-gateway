@@ -1,33 +1,37 @@
-use std::{ops::ControlFlow, sync::{atomic::AtomicBool, Arc}};
+use std::{
+    ops::ControlFlow,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use clap::Parser;
 use futures::{stream::StreamExt, SinkExt};
-use tokio::{sync::mpsc, task::JoinHandle};
+use mimalloc::MiMalloc;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
-use reqwest_eventsource::{EventSource, Event, Error as EventSourceError};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use reqwest_eventsource::{Error as EventSourceError, Event, EventSource};
 use thiserror::Error;
+use tokio::{sync::mpsc, task::JoinHandle};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use common::{
     logging::{init_logging, LogFormat, LogLevel},
     schemas::{
-        APIRequest,
-        APIRequestBody,
-        APIResponse,
-        APIResponseBody,
-        ChatCompletion,
-        ChatCompletionChunk,
-        ErrorCode,
-        ErrorResponse,
-        ListModelsResponse,
+        APIRequest, APIRequestBody, APIResponse, APIResponseBody, ChatCompletion,
+        ChatCompletionChunk, ErrorCode, ErrorResponse, ListModelsResponse,
     },
 };
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
+    /// The URL for the WebSocket gateway.
     #[clap(long, env, default_value = "ws://localhost:3000/ws")]
     gateway_url: String,
+    /// The token for the WebSocket gateway.
+    #[clap(long, env)]
+    token: String,
     /// The base URL for the API backend.
     #[clap(long, env, default_value = "https://api.openai.com")]
     api_url: String,
@@ -51,6 +55,9 @@ struct Args {
     /// Whether to disable the health check.
     #[clap(long, env)]
     disable_health_check: bool,
+    /// The number of threads for the client.
+    #[clap(long, env)]
+    num_threads: Option<usize>,
     #[clap(long, env)]
     otlp_endpoint: Option<String>,
     #[clap(long, env, default_value = "info")]
@@ -61,10 +68,9 @@ struct Args {
     log_colorize: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), ClientError> {
+fn main() -> Result<(), ClientError> {
     match dotenvy::dotenv() {
-        Ok(_) | Err(dotenvy::Error::Io(_)) => {},
+        Ok(_) | Err(dotenvy::Error::Io(_)) => {}
         Err(e) => panic!("Failed to load .env file: {:?}", e),
     }
 
@@ -72,6 +78,7 @@ async fn main() -> Result<(), ClientError> {
     println!("Args: {:?}", args);
     let Args {
         gateway_url,
+        token,
         api_url,
         api_key,
         timeout,
@@ -80,6 +87,7 @@ async fn main() -> Result<(), ClientError> {
         heartbeat_interval,
         retry,
         disable_health_check,
+        num_threads,
         otlp_endpoint,
         log_level,
         log_format,
@@ -106,6 +114,42 @@ async fn main() -> Result<(), ClientError> {
         .default_headers(headers.clone())
         .build()?;
 
+    let num_threads = num_threads.unwrap_or_else(|| num_cpus::get() * 2);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(num_threads)
+        .enable_all()
+        .build()?
+        .block_on(start(
+            gateway_url,
+            token,
+            api_url,
+            timeout,
+            healthz_interval,
+            heartbeat_interval,
+            retry,
+            disable_health_check,
+            headers,
+            http_client,
+            api_url_for_healthz,
+        ))?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start(
+    gateway_url: String,
+    token: String,
+    api_url: String,
+    timeout: u64,
+    healthz_interval: u64,
+    heartbeat_interval: u64,
+    retry: u64,
+    disable_health_check: bool,
+    headers: HeaderMap,
+    http_client: reqwest::Client,
+    api_url_for_healthz: String,
+) -> Result<(), ClientError> {
     if !disable_health_check {
         check_health(&http_client, &api_url).await?;
     }
@@ -123,22 +167,26 @@ async fn main() -> Result<(), ClientError> {
         match msg {
             Message::Ping(_) => {
                 tracing::info!("Ping received from {}", gateway_url);
-            },
+            }
             _ => {
-                tracing::error!("Unexpected message received from {}: {:?}", gateway_url, msg);
-                // TODO: use a custom error type
-                return Ok(())
-            },
+                tracing::error!(
+                    "Unexpected message received from {}: {:?}",
+                    gateway_url,
+                    msg
+                );
+                return Err(ClientError::HandShake(
+                    "Unexpected message received".to_string(),
+                ));
+            }
         }
     } else {
         tracing::error!("Server {} abruptly disconnected", gateway_url);
-        // TODO: use a custom error type
-        return Ok(())
+        return Err(ClientError::HandShake(
+            "Server abruptly disconnected".to_string(),
+        ));
     }
 
-    ws_sender
-        .send(Message::Pong("Hello".into()))
-        .await?;
+    ws_sender.send(Message::Pong(token.into())).await?;
 
     ws_sender
         .send(Message::Text(serde_json::to_string(&models)?))
@@ -146,8 +194,7 @@ async fn main() -> Result<(), ClientError> {
 
     tracing::info!("Model info sent");
 
-    let (resp_sender, mut resp_receiver) =
-        mpsc::channel::<Response>(1024);
+    let (resp_sender, mut resp_receiver) = mpsc::channel::<Response>(1024);
     let resp_sender_hb = resp_sender.clone();
 
     let closing = Arc::new(AtomicBool::new(false));
@@ -159,27 +206,21 @@ async fn main() -> Result<(), ClientError> {
     let mut send_task: JoinHandle<Result<(), ClientError>> = tokio::spawn(async move {
         while !closing_send.load(std::sync::atomic::Ordering::Relaxed) {
             match resp_receiver.recv().await {
-                Some(resp) => {
-                    match resp {
-                        Response::APIResponse(resp) => {
-                            let resp = serde_json::to_string(&resp)?;
-                            ws_sender
-                                .send(Message::Text(resp))
-                                .await?;
-                        },
-                        Response::Heartbeat => {
-                            let now = chrono::Utc::now();
-                            let body = now.timestamp().to_be_bytes().to_vec();
-                            ws_sender
-                                .send(Message::Binary(body))
-                                .await?;
-                        },
+                Some(resp) => match resp {
+                    Response::APIResponse(resp) => {
+                        let resp = serde_json::to_string(&resp)?;
+                        ws_sender.send(Message::Text(resp)).await?;
+                    }
+                    Response::Heartbeat => {
+                        let now = chrono::Utc::now();
+                        let body = now.timestamp().to_be_bytes().to_vec();
+                        ws_sender.send(Message::Binary(body)).await?;
                     }
                 },
                 None => {
                     tracing::info!("ws_sender / resp_receiver closed, exiting");
                     break;
-                },
+                }
             }
         }
 
@@ -192,28 +233,26 @@ async fn main() -> Result<(), ClientError> {
             .default_headers(headers)
             .build()?;
 
-        while !closing_recv.load(std::sync::atomic::Ordering::Relaxed){
+        while !closing_recv.load(std::sync::atomic::Ordering::Relaxed) {
             match ws_receiver.next().await {
-                Some(Ok(msg)) => {
-                    match process_message(msg).await {
-                        ControlFlow::Continue(Some(APIRequest { id, body })) => {
-                            handle_api_request(id, body, &api_url, &http_client, &resp_sender).await?;
-                        },
-                        ControlFlow::Continue(None) => {},
-                        ControlFlow::Break(()) => {
-                            tracing::info!("Received WS close message, exiting");
-                            break;
-                        },
+                Some(Ok(msg)) => match process_message(msg).await {
+                    ControlFlow::Continue(Some(APIRequest { id, body })) => {
+                        handle_api_request(id, body, &api_url, &http_client, &resp_sender).await?;
+                    }
+                    ControlFlow::Continue(None) => {}
+                    ControlFlow::Break(()) => {
+                        tracing::info!("Received WS close message, exiting");
+                        break;
                     }
                 },
                 Some(Err(e)) => {
                     tracing::error!("Failed to receive message: {}, exiting", e);
                     break;
-                },
+                }
                 None => {
                     tracing::info!("ws_receiver closed, exiting");
                     break;
-                },
+                }
             }
         }
 
@@ -301,38 +340,35 @@ async fn process_message(msg: Message) -> ControlFlow<(), Option<APIRequest>> {
                 Err(e) => {
                     tracing::error!("Failed to parse request: {}", e);
                     ControlFlow::Continue(None)
-                },
+                }
             }
-        },
+        }
         Message::Binary(b) => {
             tracing::info!("Received binary message: {} bytes, ignore it.", b.len());
             ControlFlow::Continue(None)
-        },
+        }
         Message::Ping(_) => {
             tracing::info!("Received ping message");
             ControlFlow::Continue(None)
-        },
+        }
         Message::Pong(_) => {
             tracing::info!("Received pong message");
             ControlFlow::Continue(None)
-        },
+        }
         Message::Close(c) => {
             tracing::info!("Received close message: {:?}", c);
             ControlFlow::Break(())
-        },
+        }
         _ => {
             tracing::warn!("Received unknown message type");
             ControlFlow::Continue(None)
-        },
+        }
     }
 }
 
 async fn check_health(client: &reqwest::Client, api_url: &str) -> Result<(), UnhealthyError> {
     let health_url = format!("{}/health", api_url);
-    let res = client
-        .get(&health_url)
-        .send()
-        .await?;
+    let res = client.get(&health_url).send().await?;
 
     if res.status().is_success() {
         Ok(())
@@ -343,12 +379,12 @@ async fn check_health(client: &reqwest::Client, api_url: &str) -> Result<(), Unh
     }
 }
 
-async fn list_models(client: &reqwest::Client, api_url: &str) -> Result<ListModelsResponse, ClientError> {
+async fn list_models(
+    client: &reqwest::Client,
+    api_url: &str,
+) -> Result<ListModelsResponse, ClientError> {
     let url = format!("{}/v1/models", api_url);
-    let res = client
-        .get(&url)
-        .send()
-        .await?;
+    let res = client.get(&url).send().await?;
 
     if res.status().is_success() {
         let body = res.text().await?;
@@ -368,18 +404,11 @@ async fn handle_api_request(
     resp_sender: &mpsc::Sender<Response>,
 ) -> Result<(), ClientError> {
     let (url, inner_body) = match &body {
-        APIRequestBody::OpenAIChat(body) => {
-            (
-                format!("{}/v1/chat/completions", api_url),
-                body,
-            )
-        },
+        APIRequestBody::OpenAIChat(body) => (format!("{}/v1/chat/completions", api_url), body),
     };
 
     tracing::info!("Request ID: {}, URL: {}, Body: {:?}", id, url, inner_body);
-    let request_builder = http_client
-        .post(url)
-        .json(inner_body);
+    let request_builder = http_client.post(url).json(inner_body);
 
     match body {
         APIRequestBody::OpenAIChat(request) => {
@@ -392,7 +421,7 @@ async fn handle_api_request(
                         Ok(Event::Open) => {
                             tracing::info!("EventSource opened");
                             None
-                        },
+                        }
                         Ok(Event::Message(msg)) => {
                             tracing::info!("EventSource message: {:?}", msg);
                             if msg.data == "[DONE]" {
@@ -405,13 +434,13 @@ async fn handle_api_request(
                                 })
                             } else {
                                 match serde_json::from_str::<ChatCompletionChunk>(&msg.data) {
-                                    Ok(chunk) => {
-                                        Some(APIResponse {
-                                            id,
-                                            body: APIResponseBody::from_openai_chat_completion_chunk(chunk),
-                                            once: false,
-                                        })
-                                    },
+                                    Ok(chunk) => Some(APIResponse {
+                                        id,
+                                        body: APIResponseBody::from_openai_chat_completion_chunk(
+                                            chunk,
+                                        ),
+                                        once: false,
+                                    }),
                                     Err(e) => {
                                         tracing::error!("Failed to parse response: {}", e);
                                         done = true;
@@ -423,10 +452,10 @@ async fn handle_api_request(
                                             }),
                                             once: false,
                                         })
-                                    },
+                                    }
                                 }
                             }
-                        },
+                        }
                         Err(EventSourceError::StreamEnded) if !done => {
                             tracing::error!("EventSource stream ended unexpectedly");
                             done = true;
@@ -438,7 +467,7 @@ async fn handle_api_request(
                                 }),
                                 once: false,
                             })
-                        },
+                        }
                         Err(err) => {
                             tracing::error!("EventSource error: {:?}", err);
                             done = true;
@@ -450,7 +479,7 @@ async fn handle_api_request(
                                 }),
                                 once: false,
                             })
-                        },
+                        }
                     };
 
                     if let Some(resp) = resp {
@@ -470,43 +499,46 @@ async fn handle_api_request(
                 }
             } else {
                 let resp = match request_builder.send().await {
-                    Ok(res) => {
-                        match res.text().await {
-                            Ok(body) => {
-                                match serde_json::from_str::<ChatCompletion>(&body) {
-                                    Ok(resp) => {
-                                        APIResponse {
-                                            id,
-                                            body: APIResponseBody::from_openai_chat_completion(resp),
-                                            once: true,
-                                        }
-                                    },
-                                    Err(e) => {
-                                        tracing::error!("Request ID: {}, Failed to parse response body: {}, Error: {}", id, body, e);
-                                        let msg = format!("Request ID: {}, Failed to parse response body.", id);
-                                        APIResponse {
-                                            id,
-                                            body: APIResponseBody::from_error(ErrorResponse {
-                                                error: ErrorCode::BackendError,
-                                                message: msg,
-                                            }),
-                                            once: true,
-                                        }
-                                    },
-                                }
-                            },
-                            Err(e) => {
-                                tracing::error!("Request ID: {}, Failed to read response body: {}", id, e);
-                                let msg = format!("Request ID: {}, Failed to read response body.", id);
-                                APIResponse {
+                    Ok(res) => match res.text().await {
+                        Ok(body) => {
+                            match serde_json::from_str::<ChatCompletion>(&body) {
+                                Ok(resp) => APIResponse {
                                     id,
-                                    body: APIResponseBody::from_error(ErrorResponse {
-                                        error: ErrorCode::BackendError,
-                                        message: msg,
-                                    }),
+                                    body: APIResponseBody::from_openai_chat_completion(resp),
                                     once: true,
+                                },
+                                Err(e) => {
+                                    tracing::error!("Request ID: {}, Failed to parse response body: {}, Error: {}", id, body, e);
+                                    let msg = format!(
+                                        "Request ID: {}, Failed to parse response body.",
+                                        id
+                                    );
+                                    APIResponse {
+                                        id,
+                                        body: APIResponseBody::from_error(ErrorResponse {
+                                            error: ErrorCode::BackendError,
+                                            message: msg,
+                                        }),
+                                        once: true,
+                                    }
                                 }
-                            },
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Request ID: {}, Failed to read response body: {}",
+                                id,
+                                e
+                            );
+                            let msg = format!("Request ID: {}, Failed to read response body.", id);
+                            APIResponse {
+                                id,
+                                body: APIResponseBody::from_error(ErrorResponse {
+                                    error: ErrorCode::BackendError,
+                                    message: msg,
+                                }),
+                                once: true,
+                            }
                         }
                     },
                     Err(e) => {
@@ -521,7 +553,7 @@ async fn handle_api_request(
                             }),
                             once: true,
                         }
-                    },
+                    }
                 };
 
                 resp_sender
@@ -555,6 +587,10 @@ impl Response {
 
 #[derive(Error, Debug)]
 enum ClientError {
+    #[error("Tokio runtime failed to start: {0}")]
+    Tokio(#[from] std::io::Error),
+    #[error("Handshake error: {0}")]
+    HandShake(String),
     #[error("Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
     #[error("TaskJoin error: {0}")]

@@ -1,4 +1,11 @@
-use std::{net::SocketAddr, ops::ControlFlow, sync::{atomic::{AtomicBool, AtomicI64, Ordering}, Arc}};
+use std::{
+    net::SocketAddr,
+    ops::ControlFlow,
+    sync::{
+        atomic::{AtomicBool, AtomicI64, Ordering},
+        Arc,
+    },
+};
 
 use axum::{
     extract::{
@@ -10,26 +17,28 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use tracing::instrument;
 use streamunordered::{StreamUnordered, StreamYield};
+use tracing::instrument;
 
-use common::schemas::{model::ListModelsResponse, APIResponse};
 use crate::manager::ClientManager;
+use common::schemas::{APIResponse, ClientToken, ListModelsResponse};
 
 #[instrument(skip_all)]
 pub(crate) async fn ws_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Extension(manager): Extension<ClientManager>,
+    Extension(ClientToken(client_token)): Extension<ClientToken>,
 ) -> impl IntoResponse {
     tracing::info!("WebSocket connection from {}", addr);
-    ws.on_upgrade(move |socket| handle_socket(socket, addr, manager))
+    ws.on_upgrade(move |socket| handle_socket(socket, addr, manager, client_token))
 }
 
 async fn handle_socket(
     mut socket: WebSocket,
     who: SocketAddr,
     manager: ClientManager,
+    client_token: Vec<u8>,
 ) {
     if socket.send(Message::Ping("Hello".into())).await.is_ok() {
         tracing::info!("Ping sent to {}", who);
@@ -40,43 +49,53 @@ async fn handle_socket(
 
     if let Some(Ok(msg)) = socket.recv().await {
         match msg {
-            Message::Pong(_) => {
+            Message::Pong(b) => {
                 tracing::info!("Pong received from {}", who);
-            },
+                if b != client_token {
+                    tracing::error!("Client token mismatch from {}", who);
+                    return;
+                }
+                tracing::info!("Client token verified for {}", who);
+            }
             _ => {
                 tracing::error!("Unexpected message received from {}: {:?}", who, msg);
                 return;
-            },
+            }
         }
     } else {
         tracing::error!("Client {} abruptly disconnected", who);
         return;
     }
 
+    let mut model_ids = Vec::new();
     let mut req_receivers = StreamUnordered::new();
 
     // Receive model info
     if let Some(Ok(msg)) = socket.recv().await {
         match msg {
-            Message::Text(t) => {
-                match serde_json::from_str::<ListModelsResponse>(t.as_ref()) {
-                    Ok(models) => {
-                        tracing::info!("Received model info from {}: {:?}", who, models);
-                        for model_info in models.data.into_iter() {
-                            let rx = manager.add_client(model_info);
-                            req_receivers.insert(rx);
-                        }
-                    },
-                    Err(e) => {
-                        tracing::error!("Failed to parse model info from {}: {}, Error: {}", who, t, e);
-                        return;
-                    },
+            Message::Text(t) => match serde_json::from_str::<ListModelsResponse>(t.as_ref()) {
+                Ok(models) => {
+                    tracing::info!("Received model info from {}: {:?}", who, models);
+                    for model_info in models.data.into_iter() {
+                        model_ids.push(model_info.id.clone());
+                        let rx = manager.add_client(model_info);
+                        req_receivers.insert(rx);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to parse model info from {}: {}, Error: {}",
+                        who,
+                        t,
+                        e
+                    );
+                    return;
                 }
             },
             _ => {
                 tracing::error!("Unexpected message received from {}: {:?}", who, msg);
                 return;
-            },
+            }
         }
     } else {
         tracing::error!("Disconnected from {} while waiting for model info", who);
@@ -106,7 +125,10 @@ async fn handle_socket(
             if let StreamYield::Item(req) = item {
                 let now = chrono::Utc::now().timestamp();
                 if (now - req.timestamp).abs() > 10 * 60 {
-                    tracing::warn!("Ignoring request with timestamp drift of more than 10 minutes: {:?}", req);
+                    tracing::warn!(
+                        "Ignoring request with timestamp drift of more than 10 minutes: {:?}",
+                        req
+                    );
                     continue;
                 }
 
@@ -138,7 +160,10 @@ async fn handle_socket(
                         let id: usize = resp.id;
                         let should_remove = resp.body.is_done_or_error() || resp.once;
                         if sender.send(resp).await.is_err() {
-                            tracing::warn!("Response receiver has been closed for response: {}", id);
+                            tracing::warn!(
+                                "Response receiver has been closed for response: {}",
+                                id
+                            );
                         }
                         if should_remove {
                             sender.closed().await;
@@ -148,7 +173,7 @@ async fn handle_socket(
                     } else {
                         tracing::error!("No response sender found for response: {:?}", resp);
                     }
-                },
+                }
                 ControlFlow::Continue(Response::Heartbeat(client_time)) => {
                     let now = chrono::Utc::now().timestamp();
                     if (now - client_time).abs() > 10 {
@@ -156,8 +181,8 @@ async fn handle_socket(
                     }
                     last_heartbeat_clone.store(now, Ordering::Relaxed);
                     tracing::info!("Received heartbeat from {}", who);
-                },
-                ControlFlow::Continue(Response::Ignore) => {},
+                }
+                ControlFlow::Continue(Response::Ignore) => {}
                 ControlFlow::Break(()) => break,
             }
 
@@ -178,7 +203,10 @@ async fn handle_socket(
 
                 // TODO: make this configurable
                 if (now - last_heartbeat).abs() > 10 {
-                    tracing::error!("Client {} has not sent a heartbeat in more than 10 seconds", who);
+                    tracing::error!(
+                        "Client {} has not sent a heartbeat in more than 10 seconds",
+                        who
+                    );
                     break;
                 }
             }
@@ -203,6 +231,10 @@ async fn handle_socket(
         },
     }
 
+    model_ids
+        .iter()
+        .for_each(|model_id| manager.try_remove_client(model_id));
+
     tracing::info!("Connection closed to {}", who);
 }
 
@@ -215,9 +247,9 @@ fn process_message(msg: Message, who: SocketAddr) -> ControlFlow<(), Response> {
                 Err(e) => {
                     tracing::error!("Failed to parse response from {}: {}", who, e);
                     ControlFlow::Continue(Response::Ignore)
-                },
+                }
             }
-        },
+        }
         Message::Binary(b) => {
             if b.len() == 8 {
                 // convert b to [u8; 8]
@@ -228,19 +260,19 @@ fn process_message(msg: Message, who: SocketAddr) -> ControlFlow<(), Response> {
             } else {
                 ControlFlow::Continue(Response::Ignore)
             }
-        },
+        }
         Message::Ping(_) => {
             tracing::info!("Received ping message from {}", who);
             ControlFlow::Continue(Response::Ignore)
-        },
+        }
         Message::Pong(_) => {
             tracing::info!("Received pong message from {}", who);
             ControlFlow::Continue(Response::Ignore)
-        },
+        }
         Message::Close(c) => {
             tracing::info!("Received close message from {}: {:?}", who, c);
             ControlFlow::Break(())
-        },
+        }
     }
 }
 

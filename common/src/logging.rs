@@ -1,17 +1,12 @@
 use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
     trace::{self, Sampler},
     Resource,
 };
-use opentelemetry_otlp::WithExportConfig;
 use serde::Serialize;
-use tracing_subscriber::{
-    layer::SubscriberExt,
-    util::SubscriberInitExt,
-    EnvFilter,
-    Layer,
-};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 #[derive(clap::ValueEnum, Clone, Default, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]

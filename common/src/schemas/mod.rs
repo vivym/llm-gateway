@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use utoipa::ToSchema;
 
-pub use chat::{ChatRequest, ChatCompletion, ChatCompletionChunk};
-pub use model::{ModelInfo, ListModelsResponse};
+pub use chat::{ChatCompletion, ChatCompletionChunk, ChatRequest};
+pub use model::{ListModelsResponse, ModelInfo};
 
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, ToSchema)]
 #[repr(u16)]
@@ -54,11 +54,15 @@ pub enum APIResponseBody {
 
 impl APIResponseBody {
     pub fn from_openai_chat_completion(chat_completion: ChatCompletion) -> Self {
-        Self::Success(APIResponseBodySuccess::OpenAIChatCompletion(chat_completion))
+        Self::Success(APIResponseBodySuccess::OpenAIChatCompletion(
+            chat_completion,
+        ))
     }
 
     pub fn from_openai_chat_completion_chunk(chat_completion_chunk: ChatCompletionChunk) -> Self {
-        Self::Success(APIResponseBodySuccess::OpenAIChatCompletionChunk(chat_completion_chunk))
+        Self::Success(APIResponseBodySuccess::OpenAIChatCompletionChunk(
+            chat_completion_chunk,
+        ))
     }
 
     pub fn from_error(error: ErrorResponse) -> Self {
@@ -80,3 +84,6 @@ pub enum APIResponseBodySuccess {
 pub enum APIResponseError {
     ErrorResponse(ErrorResponse),
 }
+
+#[derive(Clone)]
+pub struct ClientToken(pub Vec<u8>);

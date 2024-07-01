@@ -8,10 +8,10 @@ use axum::{
     Router,
 };
 use axum_tracing_opentelemetry::middleware::OtelAxumLayer;
-use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::instrument;
 use thiserror::Error;
 use tokio::signal;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tracing::instrument;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -19,6 +19,7 @@ use crate::{
     manager::ClientManager,
     routes::{chat::chat_completions, healthz::healthz, models::list_models, ws::ws_handler},
 };
+use common::schemas::ClientToken;
 
 #[instrument]
 async fn not_found(uri: http::Uri) -> impl IntoResponse {
@@ -31,10 +32,9 @@ async fn not_found(uri: http::Uri) -> impl IntoResponse {
 pub async fn run(
     addr: SocketAddr,
     allow_origin: Option<AllowOrigin>,
+    client_token: String,
 ) -> Result<(), WebServerError> {
-    let allow_origin = allow_origin.unwrap_or_else(|| {
-        AllowOrigin::any()
-    });
+    let allow_origin = allow_origin.unwrap_or_else(AllowOrigin::any);
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([http::header::AUTHORIZATION, http::header::CONTENT_TYPE])
@@ -45,12 +45,16 @@ pub async fn run(
     #[openapi(
         paths(
             crate::routes::healthz::healthz,
+            crate::routes::models::list_models,
             crate::routes::chat::chat_completions,
         ),
         components(schemas(
             common::schemas::ErrorCode,
             common::schemas::ErrorResponse,
+            common::schemas::model::ModelInfo,
+            common::schemas::model::ListModelsResponse,
             common::schemas::chat::ChatRequest,
+            common::schemas::chat::StreamOptions,
             common::schemas::chat::Message,
             common::schemas::chat::GrammarType,
             common::schemas::chat::ChatCompletion,
@@ -90,6 +94,7 @@ pub async fn run(
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .layer(Extension(ClientManager::new()))
+        .layer(Extension(ClientToken(client_token.into())))
         .merge(swagger_ui)
         .fallback(not_found)
         .layer(OtelAxumLayer::default())
@@ -139,4 +144,6 @@ pub enum WebServerError {
     Io(#[from] std::io::Error),
     #[error("Axum error: {0}")]
     Axum(#[from] axum::BoxError),
+    #[error("Invalid client token")]
+    InvalidClientToken,
 }

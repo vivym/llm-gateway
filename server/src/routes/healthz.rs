@@ -1,12 +1,8 @@
-use axum::{
-    extract::Extension,
-    http::StatusCode,
-    Json,
-};
+use axum::{extract::Extension, http::StatusCode, Json};
 use tracing::instrument;
 
-use common::schemas::{ErrorCode, ErrorResponse};
 use crate::manager::ClientManager;
+use common::schemas::{ErrorCode, ErrorResponse};
 
 #[utoipa::path(
     get,
