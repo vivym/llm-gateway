@@ -28,9 +28,7 @@ pub(crate) async fn auth_middleware(
 
     let token = token.ok_or(AuthError::MissingAuthorizationHeader)?;
 
-    tracing::info!("uri: {}", req.uri().path());
     if req.uri().path() == "/ws" {
-        tracing::info!("token: {}, client_token: {}", token, client_token);
         if token != client_token {
             return Err(AuthError::InvalidAccessToken);
         }

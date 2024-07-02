@@ -76,7 +76,6 @@ fn main() -> Result<(), ClientError> {
     }
 
     let args = Args::parse();
-    println!("Args: {:?}", args);
     let Args {
         gateway_url,
         token,
@@ -264,7 +263,7 @@ async fn start(
                     }
                 },
                 None => {
-                    tracing::info!("ws_sender / resp_receiver closed, exiting");
+                    tracing::info!("resp_receiver closed, exiting");
                     break;
                 }
             }
@@ -380,7 +379,7 @@ async fn start(
 async fn process_message(msg: Message) -> ControlFlow<(), Option<APIRequest>> {
     match msg {
         Message::Text(t) => {
-            tracing::info!("Received text message: {}", t);
+            tracing::debug!("Received text message: {}", t);
             match serde_json::from_str(t.as_ref()) {
                 Ok(request) => ControlFlow::Continue(Some(request)),
                 Err(e) => {
@@ -453,7 +452,7 @@ async fn handle_api_request(
         APIRequestBody::OpenAIChat(body) => (format!("{}/v1/chat/completions", api_url), body),
     };
 
-    tracing::info!("Request ID: {}, URL: {}, Body: {:?}", id, url, inner_body);
+    tracing::debug!("Request ID: {}, URL: {}, Body: {:?}", id, url, inner_body);
     let request_builder = http_client.post(url).json(inner_body);
 
     match body {
@@ -465,14 +464,14 @@ async fn handle_api_request(
                 while let Some(event) = es.next().await {
                     let resp = match event {
                         Ok(Event::Open) => {
-                            tracing::info!("EventSource opened");
+                            tracing::debug!("EventSource opened");
                             None
                         }
                         Ok(Event::Message(msg)) => {
-                            tracing::info!("EventSource message: {:?}", msg);
+                            tracing::debug!("EventSource message: {:?}", msg);
                             if msg.data == "[DONE]" {
                                 done = true;
-                                tracing::info!("EventSource done");
+                                tracing::debug!("EventSource done");
                                 Some(APIResponse {
                                     id,
                                     body: APIResponseBody::Done,

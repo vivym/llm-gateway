@@ -183,7 +183,7 @@ async fn handle_socket(
                         tracing::warn!("Client {} has a time drift of more than 10 seconds", who);
                     }
                     last_heartbeat_clone.store(now, Ordering::Relaxed);
-                    tracing::info!("Received heartbeat from {}", who);
+                    tracing::debug!("Received heartbeat from {}", who);
                 }
                 ControlFlow::Continue(Response::Ignore) => {}
                 ControlFlow::Break(()) => break,
@@ -243,7 +243,7 @@ async fn handle_socket(
 fn process_message(msg: Message, who: SocketAddr) -> ControlFlow<(), Response> {
     match msg {
         Message::Text(t) => {
-            tracing::info!("Received text message from {}: {}", who, t);
+            tracing::debug!("Received text message from {}: {}", who, t);
             match serde_json::from_str(t.as_ref()) {
                 Ok(resp) => ControlFlow::Continue(Response::Api(resp)),
                 Err(e) => {

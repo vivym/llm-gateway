@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::{convert::Infallible, time::Instant};
 
 use async_stream::__private::AsyncStream;
 use axum::{
@@ -44,10 +44,14 @@ pub(crate) async fn chat_completions(
     Extension(manager): Extension<ClientManager>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let counter = metrics::counter!("chat_completions_count");
+    counter.increment(1);
+    let start_time = Instant::now();
+
     let stream_mode = req.stream;
     let model_id = req.model.clone();
     let (tx, mut rx) = mpsc::channel::<APIResponse>(if stream_mode { 4 } else { 1 });
-    tracing::info!("Request: {:?}", req);
+    tracing::debug!("Request: {:?}", req);
 
     match manager
         .send_request(model_id, APIRequestBody::OpenAIChat(req), tx)
@@ -62,7 +66,7 @@ pub(crate) async fn chat_completions(
                                 match body {
                                     APIResponseBody::Success(resp) => match resp {
                                         APIResponseBodySuccess::OpenAIChatCompletionChunk(chunk) => {
-                                            tracing::info!("Sending chunk: {:?}", chunk);
+                                            tracing::debug!("Sending chunk: {:?}", chunk);
                                             let event = Event::default()
                                                 .json_data(chunk)
                                                 .unwrap_or_else(|err| {
@@ -79,6 +83,8 @@ pub(crate) async fn chat_completions(
                                     },
                                     APIResponseBody::Error(err) => {
                                         tracing::error!("Error response from backend: {:?}", err);
+                                        let counter = metrics::counter!("chat_completions_failure");
+                                        counter.increment(1);
                                         let event = Event::default()
                                             .json_data(err)
                                             .unwrap_or_else(|_| {
@@ -90,19 +96,25 @@ pub(crate) async fn chat_completions(
                                         break;
                                     },
                                     APIResponseBody::Done => {
-                                        tracing::info!("Done response from backend");
+                                        tracing::debug!("Done response from backend");
+                                        let counter = metrics::counter!("chat_completions_success");
+                                        counter.increment(1);
                                         break;
                                     },
                                 }
                             }
                             None => {
-                                tracing::info!("Channel closed");
+                                tracing::debug!("Channel closed");
                                 break;
                             },
                         }
+
+                        let total_time = start_time.elapsed();
+                        let hist = metrics::histogram!("chat_completions_duration");
+                        hist.record(total_time.as_secs_f64())
                     }
 
-                    tracing::info!("RespStream ended");
+                    tracing::debug!("RespStream ended");
                 };
                 let sse = Sse::new(resp_stream).keep_alive(KeepAlive::default());
                 Ok(sse.into_response())
@@ -127,7 +139,7 @@ pub(crate) async fn chat_completions(
                         _ => unreachable!("Invalid response from backend"),
                     },
                     None => {
-                        tracing::info!("Channel closed unexpectedly");
+                        tracing::error!("Channel closed unexpectedly");
                         Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(ErrorResponse {

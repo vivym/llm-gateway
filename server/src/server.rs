@@ -9,6 +9,7 @@ use axum::{
     Router,
 };
 use axum_tracing_opentelemetry::middleware::OtelAxumLayer;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use thiserror::Error;
 use tokio::signal;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -38,6 +39,22 @@ async fn not_found(uri: http::Uri) -> impl IntoResponse {
     )
 }
 
+#[utoipa::path(
+    get,
+    tag = env!("CARGO_PKG_NAME"),
+    path = "/metrics",
+    responses(
+        (
+            status = 200,
+            description = "Prometheus metrics",
+            body = String,
+        )
+    ),
+)]
+async fn metrics(prom_handle: Extension<PrometheusHandle>) -> String {
+    prom_handle.render()
+}
+
 pub async fn run(
     addr: SocketAddr,
     allow_origin: Option<AllowOrigin>,
@@ -56,6 +73,7 @@ pub async fn run(
     #[derive(OpenApi)]
     #[openapi(
         paths(
+            metrics,
             crate::routes::healthz::healthz,
             crate::routes::models::list_models,
             crate::routes::chat::chat_completions,
@@ -88,7 +106,7 @@ pub async fn run(
         tags(
             (
                 name = "llm-gateway-server",
-                description = "An API gateway for OpenAI-compatible servers."
+                description = "An API gateway for OpenAI-compatible servers.",
             )
         ),
     )]
@@ -105,14 +123,33 @@ pub async fn run(
         heartbeat_timeout,
     };
 
+    let duration_matcher = Matcher::Suffix(String::from("duration"));
+    let n_duration_buckets = 35;
+    let mut duration_buckets = Vec::with_capacity(n_duration_buckets);
+    let mut value = 0.0001;
+    for _ in 0..n_duration_buckets {
+        // geometric progression
+        value *= 1.5;
+        duration_buckets.push(value);
+    }
+
+    let builder = PrometheusBuilder::new()
+        .set_buckets_for_metric(duration_matcher, &duration_buckets)
+        .unwrap();
+    let prom_handle = builder
+        .install_recorder()
+        .expect("Failed to install metrics recorder");
+
     let app = Router::new()
         .route("/", get(healthz))
         .route("/healthz", get(healthz))
         .route("/ping", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/ws", get(ws_handler))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .layer(Extension(ClientManager::new()))
+        .layer(Extension(prom_handle))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

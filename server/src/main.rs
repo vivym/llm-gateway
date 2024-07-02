@@ -48,7 +48,6 @@ fn main() -> Result<(), LLMGatewayError> {
     }
 
     let args = Args::parse();
-    println!("Args: {:?}", args);
     let Args {
         host,
         port,

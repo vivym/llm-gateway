@@ -36,6 +36,8 @@ common = { path = "../common" }
 rand = "0.8.5"
 num_cpus.workspace = true
 mimalloc.workspace = true
+metrics-exporter-prometheus = "0.15.1"
+metrics = "0.23.0"
 
 [build-dependencies]
 vergen.workspace = true
