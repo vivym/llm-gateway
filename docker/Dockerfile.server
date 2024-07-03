@@ -1,4 +1,4 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+FROM --platform=linux/amd64 lukemathwalker/cargo-chef:latest-rust-1 AS chef
 
 WORKDIR /app
 
@@ -23,7 +23,7 @@ COPY . .
 RUN cargo build --profile ${PROFILE} --bin llm-gateway-server
 
 # We do not need the Rust toolchain to run the binary!
-FROM debian:bookworm-slim AS runtime
+FROM --platform=linux/amd64 debian:bookworm-slim AS runtime
 
 ARG PROFILE=release
 

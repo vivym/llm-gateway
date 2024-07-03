@@ -10,7 +10,7 @@ repository.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
 tokio.workspace = true
-tokio-tungstenite = "0.23.1"
+tokio-tungstenite = { version = "0.23.1", features = ["native-tls"] }
 tracing.workspace = true
 futures.workspace = true
 reqwest = { version = "0.12.5", features = ["json"] }
@@ -21,7 +21,7 @@ chrono.workspace = true
 common = { path = "../common" }
 num_cpus.workspace = true
 mimalloc.workspace = true
-tungstenite = "0.23.0"
+tungstenite = { version = "0.23.0", features = ["native-tls"] }
 opentelemetry.workspace = true
 
 [build-dependencies]

@@ -115,7 +115,7 @@ fn main() -> Result<(), ClientError> {
         .build()?;
 
     let num_threads = num_threads.unwrap_or_else(|| num_cpus::get() * 2);
-    tokio::runtime::Builder::new_multi_thread()
+    let res = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(num_threads)
         .enable_all()
         .build()?
@@ -156,24 +156,32 @@ fn main() -> Result<(), ClientError> {
 
             tokio::select! {
                 res = (&mut task) => {
-                    let _ = res?;
+                    tracing::info!("res: {:?}", res);
+                    let _ = res??;
                 },
                 _ = ctrl_c => {
                     tracing::info!("Received Ctrl-C, starting graceful shutdown");
                     closing.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let _ = task.await?;
+                    let _ = task.await??;
                 },
                 _ = terminate => {
                     tracing::info!("Received terminate signal, starting graceful shutdown");
                     closing.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let _ = task.await?;
+                    let _ = task.await??;
                 },
             }
 
             opentelemetry::global::shutdown_tracer_provider();
 
+            tracing::info!("Client exited");
+
             Result::<(), ClientError>::Ok(())
-        })?;
+        });
+
+    if let Err(e) = res {
+        tracing::error!("Client error: {}", e);
+        return Err(e);
+    }
 
     Ok(())
 }
@@ -202,6 +210,7 @@ async fn start(
 
     let builder = ClientRequestBuilder::new(gateway_url.parse().unwrap())
         .with_header("Authorization", format!("Bearer {}", token));
+    tracing::info!("builder: {:?}", builder);
     let (ws_stream, _) = connect_async(builder).await?;
 
     tracing::info!("Connected to gateway: {}", gateway_url);
